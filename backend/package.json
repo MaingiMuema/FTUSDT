@@ -1,0 +1,16 @@
+{
+  "name": "ftusdt-backend",
+  "version": "1.0.0",
+  "description": "Flash USDT Token Backend",
+  "main": "migrations/deploy.js",
+  "scripts": {
+    "compile": "tronbox compile",
+    "deploy:testnet": "node migrations/deploy.js",
+    "deploy:mainnet": "NETWORK=mainnet node migrations/deploy.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "tronbox": "^3.3.0",
+    "tronweb": "^5.0.0"
+  }
+}
