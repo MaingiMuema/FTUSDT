@@ -31,8 +31,9 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
     mapping(bytes32 => FlashTransaction) private _flashTransactions;
     mapping(address => bytes32[]) private _userFlashTransactions;
     
-    // Time window for flash transactions (in seconds)
-    uint256 public constant FLASH_WINDOW = 15 minutes;
+    // Time window constraints for flash transactions (in seconds)
+    uint256 public constant MIN_FLASH_WINDOW = 1 minutes;
+    uint256 public constant MAX_FLASH_WINDOW = 24 hours;
     uint256 public constant MAX_FLASH_AMOUNT = 1000000 * 10**6; // 1M FTUSDT
 
     // Fee structure
@@ -58,6 +59,12 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
         return true;
     }
 
+    function approve(address spender, uint256 amount) public override whenNotPaused returns (bool) {
+        require(!isFlashTransaction(msg.sender), "FTUSDT: sender has pending flash transaction");
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
+
     function transferFrom(address sender, address recipient, uint256 amount) public override whenNotPaused returns (bool) {
         require(!isFlashTransaction(sender), "FTUSDT: sender has pending flash transaction");
         
@@ -73,18 +80,35 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
     }
 
     /**
-     * @dev Creates a new flash transaction
+     * @dev Creates a new flash transaction with custom time window
      * @param recipient The recipient of the flash transaction
      * @param amount The amount of tokens to transfer
+     * @param timeWindow The time window in seconds for the transaction to be valid
      * @return txId The unique identifier of the flash transaction
      */
-    function createFlashTransaction(address recipient, uint256 amount) public whenNotPaused returns (bytes32) {
+    function createFlashTransaction(
+        address recipient, 
+        uint256 amount,
+        uint256 timeWindow
+    ) public whenNotPaused returns (bytes32) {
         require(amount <= MAX_FLASH_AMOUNT, "FTUSDT: amount exceeds maximum flash amount");
         require(recipient != address(0), "FTUSDT: invalid recipient");
         require(_balances[msg.sender] >= amount, "FTUSDT: insufficient balance");
+        require(
+            timeWindow >= MIN_FLASH_WINDOW && timeWindow <= MAX_FLASH_WINDOW,
+            "FTUSDT: invalid time window"
+        );
 
-        uint256 deadline = block.timestamp + FLASH_WINDOW;
-        bytes32 txId = keccak256(abi.encodePacked(msg.sender, recipient, amount, deadline, block.timestamp));
+        uint256 deadline = block.timestamp + timeWindow;
+        bytes32 txId = keccak256(
+            abi.encodePacked(
+                msg.sender, 
+                recipient, 
+                amount, 
+                deadline, 
+                block.timestamp
+            )
+        );
 
         _flashTransactions[txId] = FlashTransaction({
             amount: amount,
@@ -97,6 +121,19 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
 
         emit FlashTransactionCreated(txId, msg.sender, recipient, amount, deadline);
         return txId;
+    }
+
+    /**
+     * @dev Creates a new flash transaction with default time window (15 minutes)
+     * @param recipient The recipient of the flash transaction
+     * @param amount The amount of tokens to transfer
+     * @return txId The unique identifier of the flash transaction
+     */
+    function createFlashTransaction(
+        address recipient, 
+        uint256 amount
+    ) public whenNotPaused returns (bytes32) {
+        return createFlashTransaction(recipient, amount, 15 minutes);
     }
 
     /**
