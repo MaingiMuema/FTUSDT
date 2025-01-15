@@ -4,6 +4,7 @@ import { useState } from 'react';
 import Link from 'next/link';
 import { Dialog } from '@headlessui/react';
 import { Bars3Icon, XMarkIcon } from '@heroicons/react/24/outline';
+import { useWeb3Context } from '@/context/Web3Context';
 
 const navigation = [
   { name: 'Home', href: '/' },
@@ -14,6 +15,7 @@ const navigation = [
 
 export default function Header() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const { account, connect, loading } = useWeb3Context();
 
   return (
     <header className="absolute inset-x-0 top-0 z-50">
@@ -42,11 +44,24 @@ export default function Header() {
           ))}
         </div>
         <div className="hidden lg:flex lg:flex-1 lg:justify-end">
-          <button
-            className="rounded-md bg-indigo-600 px-3.5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
-          >
-            Connect Wallet
-          </button>
+          <div className="py-6">
+            {account ? (
+              <Link
+                href="/dashboard"
+                className="w-full rounded-md bg-indigo-600 px-3.5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 text-center block"
+              >
+                Dashboard
+              </Link>
+            ) : (
+              <button
+                onClick={connect}
+                disabled={loading}
+                className="w-full rounded-md bg-indigo-600 px-3.5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:opacity-50"
+              >
+                {loading ? 'Connecting...' : 'Connect Wallet'}
+              </button>
+            )}
+          </div>
         </div>
       </nav>
       <Dialog as="div" className="lg:hidden" open={mobileMenuOpen} onClose={setMobileMenuOpen}>
@@ -78,13 +93,32 @@ export default function Header() {
                     {item.name}
                   </a>
                 ))}
+                {account && (
+                  <Link
+                    href="/dashboard"
+                    className="-mx-3 block rounded-lg px-3 py-2 text-base font-semibold leading-7 text-gray-900 hover:bg-gray-50"
+                  >
+                    Dashboard
+                  </Link>
+                )}
               </div>
               <div className="py-6">
-                <button
-                  className="w-full rounded-md bg-indigo-600 px-3.5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
-                >
-                  Connect Wallet
-                </button>
+                {account ? (
+                  <Link
+                    href="/dashboard"
+                    className="w-full rounded-md bg-indigo-600 px-3.5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 text-center block"
+                  >
+                    Dashboard
+                  </Link>
+                ) : (
+                  <button
+                    onClick={connect}
+                    disabled={loading}
+                    className="w-full rounded-md bg-indigo-600 px-3.5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:opacity-50"
+                  >
+                    {loading ? 'Connecting...' : 'Connect Wallet'}
+                  </button>
+                )}
               </div>
             </div>
           </div>
