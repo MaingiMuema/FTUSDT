@@ -2,6 +2,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import Web3 from 'web3';
 import { AbiItem } from 'web3-utils';
+import BN from 'bn.js';
 import CollateralManagerABI from '../contracts/CollateralManager.json';
 import FTUSDT_ABI from '../contracts/FTUSDT.json';
 
@@ -80,8 +81,10 @@ export const validateFlashTransaction = (
   minExecutionTime: number
 ): string | null => {
   const amountWei = Web3.utils.toWei(amount, 'ether');
+  const amountBN = new BN(amountWei);
+  const maxAmountBN = new BN(MAX_FLASH_AMOUNT);
   
-  if (Web3.utils.toBN(amountWei).gt(Web3.utils.toBN(MAX_FLASH_AMOUNT))) {
+  if (amountBN.gt(maxAmountBN)) {
     return 'Amount exceeds maximum allowed';
   }
   
