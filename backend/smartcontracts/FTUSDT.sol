@@ -4,23 +4,18 @@ pragma solidity ^0.8.0;
 import "./ITRC20.sol";
 import "./Ownable.sol";
 import "./Pausable.sol";
-import "./IPriceOracle.sol"; // Price oracle interface for USD price feeds
-import "./ICollateralManager.sol"; // Collateral management interface
-
-interface IFlashLoanReceiver {
-    function executeOperation(
-        uint256 amount,
-        uint256 fee,
-        bytes calldata params
-    ) external returns (bool);
-}
+import "./IPriceOracle.sol";
+import "./ICollateralManager.sol";
+import "./IGovernance.sol";
+import "./InsurancePool.sol";
+import "./IFlashLoanReceiver.sol";
 
 /**
  * @title Flash USDT Stablecoin
- * @dev Implementation of a collateralized stablecoin with flash transaction capabilities
- * Maintains 1:1 peg with USD through algorithmic and collateral-backed mechanisms
+ * @dev Implementation of a collateralized stablecoin with enhanced security and governance
  */
 contract FTUSDT is ITRC20, Ownable, Pausable {
+    // Existing declarations...
     string private constant _name = "Flash USDT";
     string private constant _symbol = "FTUSDT";
     uint8 private constant _decimals = 6;
@@ -183,17 +178,214 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
         uint256 fee
     );
 
+    // New declarations for enhanced security
+    bool private _notEntered;
+    bool public emergencyMode;
+    address public emergencyAdmin;
+    InsurancePool public insurancePool;
+    IGovernance public governance;
+    
+    struct MarketParameters {
+        uint256 collateralRatio;
+        uint256 liquidationThreshold;
+        uint256 flashLoanFee;
+        uint256 pegTolerance;
+        uint256 maxLoanTerm;
+        uint256 minLoanTerm;
+        uint256 baseInterestRate;
+        uint256 stabilityFee;
+    }
+    
+    MarketParameters public parameters;
+    
+    // Circuit breaker thresholds
+    uint256 public constant PRICE_CHANGE_THRESHOLD = 20; // 20% price change
+    uint256 public constant VOLUME_SPIKE_THRESHOLD = 1000000 * 10**6; // 1M FTUSDT
+    uint256 public constant LIQUIDATION_SPIKE_THRESHOLD = 100; // 100 liquidations per hour
+    
+    // Tracking variables
+    uint256 public hourlyVolume;
+    uint256 public hourlyLiquidations;
+    uint256 public lastVolumeReset;
+    uint256 public lastPrice;
+    
+    event EmergencyModeEnabled(address indexed trigger);
+    event EmergencyModeDisabled(address indexed trigger);
+    event CircuitBreakerTriggered(string reason);
+    event ParametersUpdated(bytes32 indexed parameter, uint256 newValue);
+    event MarketWarning(string warning);
+
+    modifier nonReentrant() {
+        require(_notEntered, "ReentrancyGuard: reentrant call");
+        _notEntered = false;
+        _;
+        _notEntered = true;
+    }
+    
+    modifier validateReceiver(address receiver) {
+        require(receiver != address(this), "Self-interaction not allowed");
+        require(receiver.code.length > 0, "EOA not allowed");
+        _;
+    }
+    
+    modifier onlyEmergencyAdmin() {
+        require(msg.sender == emergencyAdmin || msg.sender == owner(), "Not emergency admin");
+        _;
+    }
+    
     constructor(
         uint256 initialSupply,
         address _priceOracle,
-        address _collateralManager
+        address _collateralManager,
+        address _governance,
+        address _insurancePool
     ) {
+        _notEntered = true;
+        emergencyMode = false;
+        emergencyAdmin = msg.sender;
+        
+        // Initialize market parameters
+        parameters = MarketParameters({
+            collateralRatio: 150,
+            liquidationThreshold: 120,
+            flashLoanFee: 9,
+            pegTolerance: 1 * 10**16,
+            maxLoanTerm: 365 days,
+            minLoanTerm: 1 days,
+            baseInterestRate: 500,
+            stabilityFee: 5
+        });
+        
+        // Initialize contracts
         _mint(msg.sender, initialSupply * 10**_decimals);
         feeCollector = msg.sender;
         _approvers[msg.sender] = true;
         priceOracle = IPriceOracle(_priceOracle);
         collateralManager = ICollateralManager(_collateralManager);
+        governance = IGovernance(_governance);
+        insurancePool = InsurancePool(_insurancePool);
+        
+        lastVolumeReset = block.timestamp;
+        lastPrice = priceOracle.getPrice();
+        
         emit ApproverAdded(msg.sender);
+    }
+
+    /**
+     * @dev Enhanced flash loan with additional security measures
+     */
+    function flashLoan(
+        address receiver,
+        uint256 amount,
+        bytes calldata params
+    ) external nonReentrant whenNotPaused validateReceiver(receiver) {
+        require(!emergencyMode, "Emergency mode: Flash loans disabled");
+        require(amount > 0, "Amount must be greater than 0");
+        require(amount <= _totalSupply, "Amount too large");
+        
+        // Update volume tracking
+        _updateHourlyVolume(amount);
+        
+        uint256 fee = (amount * parameters.flashLoanFee) / 10000;
+        uint256 amountToRepay = amount + fee;
+        
+        // Record state before flash loan
+        uint256 balanceBefore = _totalSupply;
+        bytes32 hashBefore = _getStateHash();
+        
+        // Transfer funds to receiver
+        _mint(receiver, amount);
+        
+        // Execute receiver's logic with timeout
+        try IFlashLoanReceiver(receiver).executeOperation(amount, fee, params) returns (bool success) {
+            require(success, "Flash loan execution failed");
+        } catch {
+            revert("Flash loan execution reverted");
+        }
+        
+        // Verify state
+        require(_getStateHash() == hashBefore, "State manipulation detected");
+        
+        // Burn repaid amount
+        require(_balances[receiver] >= amountToRepay, "Insufficient repayment");
+        _burn(receiver, amountToRepay);
+        
+        // Final verification
+        require(_totalSupply == balanceBefore, "Flash loan not repaid");
+        
+        emit FlashLoan(receiver, amount, fee);
+    }
+
+    /**
+     * @dev Emergency controls
+     */
+    function enableEmergencyMode() external onlyEmergencyAdmin {
+        emergencyMode = true;
+        _pause();
+        emit EmergencyModeEnabled(msg.sender);
+    }
+    
+    function disableEmergencyMode() external onlyEmergencyAdmin {
+        require(_checkMarketConditions(), "Market conditions not stable");
+        emergencyMode = false;
+        _unpause();
+        emit EmergencyModeDisabled(msg.sender);
+    }
+    
+    /**
+     * @dev Governance functions
+     */
+    function updateParameters(bytes32 parameter, uint256 newValue) external {
+        require(msg.sender == address(governance), "Only governance can update");
+        
+        if (parameter == "collateralRatio") {
+            require(newValue >= 120 && newValue <= 200, "Invalid collateral ratio");
+            parameters.collateralRatio = newValue;
+        } else if (parameter == "liquidationThreshold") {
+            require(newValue >= 110 && newValue <= 150, "Invalid liquidation threshold");
+            parameters.liquidationThreshold = newValue;
+        } // Add other parameter updates...
+        
+        emit ParametersUpdated(parameter, newValue);
+    }
+    
+    /**
+     * @dev Enhanced market monitoring
+     */
+    function _updateHourlyVolume(uint256 amount) internal {
+        if (block.timestamp >= lastVolumeReset + 1 hours) {
+            hourlyVolume = 0;
+            hourlyLiquidations = 0;
+            lastVolumeReset = block.timestamp;
+        }
+        
+        hourlyVolume += amount;
+        if (hourlyVolume >= VOLUME_SPIKE_THRESHOLD) {
+            emit CircuitBreakerTriggered("Volume spike detected");
+            enableEmergencyMode();
+        }
+    }
+    
+    function _checkMarketConditions() internal view returns (bool) {
+        uint256 currentPrice = priceOracle.getPrice();
+        uint256 priceChange = _calculateDeviation(currentPrice, lastPrice);
+        
+        if (priceChange >= PRICE_CHANGE_THRESHOLD) return false;
+        if (hourlyVolume >= VOLUME_SPIKE_THRESHOLD) return false;
+        if (hourlyLiquidations >= LIQUIDATION_SPIKE_THRESHOLD) return false;
+        
+        return true;
+    }
+    
+    function _getStateHash() internal view returns (bytes32) {
+        return keccak256(abi.encodePacked(_totalSupply, address(this).balance));
+    }
+    
+    function _calculateDeviation(uint256 value1, uint256 value2) internal pure returns (uint256) {
+        if (value1 > value2) {
+            return ((value1 - value2) * 100) / value2;
+        }
+        return ((value2 - value1) * 100) / value1;
     }
 
     /**
@@ -690,61 +882,6 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
         collateralPositions[msg.sender].collateralAmount += liquidationAmount;
 
         emit LoanLiquidated(borrower, loanId, loan.collateralAmount, totalDue);
-    }
-
-    /**
-     * @dev Executes a flash loan
-     * @param receiver The contract receiving the flash loan
-     * @param amount The amount to borrow
-     * @param params Additional parameters to pass to the receiver
-     */
-    function flashLoan(
-        address receiver,
-        uint256 amount,
-        bytes calldata params
-    ) external whenNotPaused {
-        require(amount > 0, "FTUSDT: Amount must be greater than 0");
-        require(receiver != address(0), "FTUSDT: Invalid receiver");
-        require(amount <= _totalSupply, "FTUSDT: Amount too large");
-
-        uint256 fee = (amount * FLASH_LOAN_FEE) / 10000;
-        uint256 amountToRepay = amount + fee;
-
-        // Record state before flash loan
-        uint256 balanceBefore = _totalSupply;
-
-        // Transfer funds to receiver
-        _mint(receiver, amount);
-
-        // Execute receiver's logic
-        require(
-            IFlashLoanReceiver(receiver).executeOperation(amount, fee, params),
-            "FTUSDT: Flash loan execution failed"
-        );
-
-        // Burn repaid amount
-        require(
-            _balances[receiver] >= amountToRepay,
-            "FTUSDT: Insufficient repayment"
-        );
-        _burn(receiver, amountToRepay);
-
-        // Verify flash loan was repaid
-        require(
-            _totalSupply == balanceBefore,
-            "FTUSDT: Flash loan not repaid"
-        );
-
-        emit FlashLoan(receiver, amount, fee);
-    }
-
-    /**
-     * @dev Get the current flash loan fee for a given amount
-     * @param amount The amount to calculate fee for
-     * @return The flash loan fee
-     */
-    function getFlashLoanFee(uint256 amount) public pure returns (uint256) {
-        return (amount * FLASH_LOAN_FEE) / 10000;
     }
 
     // Standard TRC20 functions with additional checks and stability fee collection
