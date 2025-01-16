@@ -7,6 +7,14 @@ import "./Pausable.sol";
 import "./IPriceOracle.sol"; // Price oracle interface for USD price feeds
 import "./ICollateralManager.sol"; // Collateral management interface
 
+interface IFlashLoanReceiver {
+    function executeOperation(
+        uint256 amount,
+        uint256 fee,
+        bytes calldata params
+    ) external returns (bool);
+}
+
 /**
  * @title Flash USDT Stablecoin
  * @dev Implementation of a collateralized stablecoin with flash transaction capabilities
@@ -90,7 +98,33 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
     
     mapping(address => CollateralPosition) public collateralPositions;
     
-    // Events
+    // Loan system parameters
+    uint256 public constant MIN_LOAN_TERM = 1 days;
+    uint256 public constant MAX_LOAN_TERM = 365 days;
+    uint256 public constant BASE_INTEREST_RATE = 500; // 5% annual rate in basis points
+    uint256 public constant INTEREST_RATE_MULTIPLIER = 100; // For risk adjustment
+    uint256 public constant LATE_PAYMENT_PENALTY = 1000; // 10% penalty in basis points
+    
+    struct Loan {
+        uint256 principal;
+        uint256 collateralAmount;
+        uint256 interestRate;
+        uint256 term;
+        uint256 startTime;
+        uint256 lastInterestPayment;
+        uint256 totalRepaid;
+        bool active;
+        LoanStatus status;
+    }
+    
+    enum LoanStatus { PENDING, ACTIVE, REPAID, DEFAULTED, LIQUIDATED }
+    
+    mapping(address => Loan[]) public userLoans;
+    mapping(address => uint256) public activeLoanCount;
+    
+    // Flash loan parameters
+    uint256 public constant FLASH_LOAN_FEE = 9; // 0.09% fee
+    
     event FlashTransactionCreated(
         bytes32 indexed txId,
         address indexed sender,
@@ -118,6 +152,36 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
     event PositionLiquidated(address indexed user, uint256 collateralAmount, uint256 debtAmount);
     event PegAdjustment(uint256 previousPrice, uint256 newPrice);
     event StabilityFeeCollected(address indexed user, uint256 feeAmount);
+    event LoanCreated(
+        address indexed borrower,
+        uint256 indexed loanId,
+        uint256 principal,
+        uint256 collateralAmount,
+        uint256 interestRate,
+        uint256 term
+    );
+    event LoanRepayment(
+        address indexed borrower,
+        uint256 indexed loanId,
+        uint256 amount,
+        uint256 remainingBalance
+    );
+    event LoanLiquidated(
+        address indexed borrower,
+        uint256 indexed loanId,
+        uint256 collateralAmount,
+        uint256 debtAmount
+    );
+    event LoanCompleted(
+        address indexed borrower,
+        uint256 indexed loanId,
+        uint256 totalRepaid
+    );
+    event FlashLoan(
+        address indexed receiver,
+        uint256 amount,
+        uint256 fee
+    );
 
     constructor(
         uint256 initialSupply,
@@ -445,6 +509,242 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
         uint256 currentPrice = priceOracle.getPrice();
         return (currentPrice >= PEG_PRICE - PEG_TOLERANCE) && 
                (currentPrice <= PEG_PRICE + PEG_TOLERANCE);
+    }
+
+    /**
+     * @dev Creates a new loan with collateral
+     * @param principal Amount to borrow
+     * @param term Loan duration in seconds
+     * @return loanId The ID of the created loan
+     */
+    function createLoan(
+        uint256 principal,
+        uint256 term
+    ) external whenNotPaused returns (uint256) {
+        require(principal >= MIN_MINT_AMOUNT, "FTUSDT: Principal too low");
+        require(principal <= MAX_MINT_AMOUNT, "FTUSDT: Principal too high");
+        require(term >= MIN_LOAN_TERM, "FTUSDT: Term too short");
+        require(term <= MAX_LOAN_TERM, "FTUSDT: Term too long");
+        require(activeLoanCount[msg.sender] < 5, "FTUSDT: Too many active loans");
+
+        uint256 requiredCollateral = calculateRequiredCollateral(principal);
+        require(
+            collateralPositions[msg.sender].collateralAmount >= requiredCollateral,
+            "FTUSDT: Insufficient collateral"
+        );
+
+        uint256 interestRate = calculateInterestRate(
+            principal,
+            requiredCollateral,
+            term
+        );
+
+        Loan memory newLoan = Loan({
+            principal: principal,
+            collateralAmount: requiredCollateral,
+            interestRate: interestRate,
+            term: term,
+            startTime: block.timestamp,
+            lastInterestPayment: block.timestamp,
+            totalRepaid: 0,
+            active: true,
+            status: LoanStatus.ACTIVE
+        });
+
+        uint256 loanId = userLoans[msg.sender].length;
+        userLoans[msg.sender].push(newLoan);
+        activeLoanCount[msg.sender]++;
+
+        // Lock collateral
+        collateralPositions[msg.sender].collateralAmount -= requiredCollateral;
+        
+        // Mint and transfer the loan amount
+        _mint(msg.sender, principal);
+
+        emit LoanCreated(
+            msg.sender,
+            loanId,
+            principal,
+            requiredCollateral,
+            interestRate,
+            term
+        );
+
+        return loanId;
+    }
+
+    /**
+     * @dev Calculates the interest rate based on loan parameters
+     */
+    function calculateInterestRate(
+        uint256 principal,
+        uint256 collateral,
+        uint256 term
+    ) public view returns (uint256) {
+        uint256 collateralRatio = (collateral * 100) / principal;
+        uint256 riskAdjustment = collateralRatio >= 200
+            ? 0
+            : ((200 - collateralRatio) * INTEREST_RATE_MULTIPLIER) / 100;
+        
+        uint256 termAdjustment = (term * INTEREST_RATE_MULTIPLIER) / MAX_LOAN_TERM;
+        
+        return BASE_INTEREST_RATE + riskAdjustment + termAdjustment;
+    }
+
+    /**
+     * @dev Calculates required collateral for a loan
+     */
+    function calculateRequiredCollateral(uint256 principal) public view returns (uint256) {
+        return (principal * MINIMUM_COLLATERAL_RATIO) / 100;
+    }
+
+    /**
+     * @dev Make a repayment towards a loan
+     */
+    function repayLoan(uint256 loanId, uint256 amount) external whenNotPaused {
+        require(loanId < userLoans[msg.sender].length, "FTUSDT: Invalid loan ID");
+        Loan storage loan = userLoans[msg.sender][loanId];
+        require(loan.active, "FTUSDT: Loan not active");
+        require(amount > 0, "FTUSDT: Invalid amount");
+        require(_balances[msg.sender] >= amount, "FTUSDT: Insufficient balance");
+
+        uint256 interest = calculateInterestDue(loan);
+        uint256 totalDue = loan.principal + interest;
+        require(loan.totalRepaid + amount <= totalDue, "FTUSDT: Overpayment");
+
+        // Process payment
+        _burn(msg.sender, amount);
+        loan.totalRepaid += amount;
+        loan.lastInterestPayment = block.timestamp;
+
+        // Check if loan is fully repaid
+        if (loan.totalRepaid >= totalDue) {
+            completeLoan(msg.sender, loanId);
+        }
+
+        emit LoanRepayment(msg.sender, loanId, amount, totalDue - loan.totalRepaid);
+    }
+
+    /**
+     * @dev Calculates interest due for a loan
+     */
+    function calculateInterestDue(Loan storage loan) internal view returns (uint256) {
+        if (!loan.active) return 0;
+        
+        uint256 timeElapsed = block.timestamp - loan.lastInterestPayment;
+        uint256 annualInterest = (loan.principal * loan.interestRate) / 10000;
+        uint256 interest = (annualInterest * timeElapsed) / 365 days;
+        
+        // Add late payment penalty if applicable
+        if (block.timestamp > loan.startTime + loan.term) {
+            uint256 overduePeriod = block.timestamp - (loan.startTime + loan.term);
+            uint256 penaltyInterest = (loan.principal * LATE_PAYMENT_PENALTY * overduePeriod) / (10000 * 365 days);
+            interest += penaltyInterest;
+        }
+        
+        return interest;
+    }
+
+    /**
+     * @dev Completes a loan and returns collateral
+     */
+    function completeLoan(address borrower, uint256 loanId) internal {
+        Loan storage loan = userLoans[borrower][loanId];
+        require(loan.active, "FTUSDT: Loan not active");
+
+        loan.active = false;
+        loan.status = LoanStatus.REPAID;
+        activeLoanCount[borrower]--;
+
+        // Return collateral
+        collateralPositions[borrower].collateralAmount += loan.collateralAmount;
+
+        emit LoanCompleted(borrower, loanId, loan.totalRepaid);
+    }
+
+    /**
+     * @dev Liquidates a loan if it's eligible
+     */
+    function liquidateLoan(address borrower, uint256 loanId) external whenNotPaused {
+        require(loanId < userLoans[borrower].length, "FTUSDT: Invalid loan ID");
+        Loan storage loan = userLoans[borrower][loanId];
+        require(loan.active, "FTUSDT: Loan not active");
+
+        uint256 totalDue = loan.principal + calculateInterestDue(loan);
+        bool isOverdue = block.timestamp > loan.startTime + loan.term;
+        uint256 collateralValue = getCollateralValue(loan.collateralAmount);
+        bool isUndercollateralized = collateralValue < totalDue;
+
+        require(
+            isOverdue || isUndercollateralized,
+            "FTUSDT: Loan not eligible for liquidation"
+        );
+
+        // Process liquidation
+        loan.active = false;
+        loan.status = LoanStatus.LIQUIDATED;
+        activeLoanCount[borrower]--;
+
+        // Transfer collateral to liquidator with penalty
+        uint256 liquidationAmount = (loan.collateralAmount * (100 - LIQUIDATION_PENALTY)) / 100;
+        collateralPositions[msg.sender].collateralAmount += liquidationAmount;
+
+        emit LoanLiquidated(borrower, loanId, loan.collateralAmount, totalDue);
+    }
+
+    /**
+     * @dev Executes a flash loan
+     * @param receiver The contract receiving the flash loan
+     * @param amount The amount to borrow
+     * @param params Additional parameters to pass to the receiver
+     */
+    function flashLoan(
+        address receiver,
+        uint256 amount,
+        bytes calldata params
+    ) external whenNotPaused {
+        require(amount > 0, "FTUSDT: Amount must be greater than 0");
+        require(receiver != address(0), "FTUSDT: Invalid receiver");
+        require(amount <= _totalSupply, "FTUSDT: Amount too large");
+
+        uint256 fee = (amount * FLASH_LOAN_FEE) / 10000;
+        uint256 amountToRepay = amount + fee;
+
+        // Record state before flash loan
+        uint256 balanceBefore = _totalSupply;
+
+        // Transfer funds to receiver
+        _mint(receiver, amount);
+
+        // Execute receiver's logic
+        require(
+            IFlashLoanReceiver(receiver).executeOperation(amount, fee, params),
+            "FTUSDT: Flash loan execution failed"
+        );
+
+        // Burn repaid amount
+        require(
+            _balances[receiver] >= amountToRepay,
+            "FTUSDT: Insufficient repayment"
+        );
+        _burn(receiver, amountToRepay);
+
+        // Verify flash loan was repaid
+        require(
+            _totalSupply == balanceBefore,
+            "FTUSDT: Flash loan not repaid"
+        );
+
+        emit FlashLoan(receiver, amount, fee);
+    }
+
+    /**
+     * @dev Get the current flash loan fee for a given amount
+     * @param amount The amount to calculate fee for
+     * @return The flash loan fee
+     */
+    function getFlashLoanFee(uint256 amount) public pure returns (uint256) {
+        return (amount * FLASH_LOAN_FEE) / 10000;
     }
 
     // Standard TRC20 functions with additional checks and stability fee collection
