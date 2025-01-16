@@ -319,12 +319,16 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
     /**
      * @dev Emergency controls
      */
-    function enableEmergencyMode() external onlyEmergencyAdmin {
+    function _enableEmergencyMode() internal {
         emergencyMode = true;
         _pause();
         emit EmergencyModeEnabled(msg.sender);
     }
-    
+
+    function enableEmergencyMode() external onlyEmergencyAdmin {
+        _enableEmergencyMode();
+    }
+
     function disableEmergencyMode() external onlyEmergencyAdmin {
         require(_checkMarketConditions(), "Market conditions not stable");
         emergencyMode = false;
@@ -362,7 +366,7 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
         hourlyVolume += amount;
         if (hourlyVolume >= VOLUME_SPIKE_THRESHOLD) {
             emit CircuitBreakerTriggered("Volume spike detected");
-            enableEmergencyMode();
+            _enableEmergencyMode();
         }
     }
     
