@@ -776,7 +776,7 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
         uint256 principal,
         uint256 collateral,
         uint256 term
-    ) public view returns (uint256) {
+    ) public pure returns (uint256) {
         uint256 collateralRatio = (collateral * 100) / principal;
         uint256 riskAdjustment = collateralRatio >= 200
             ? 0
@@ -790,7 +790,7 @@ contract FTUSDT is ITRC20, Ownable, Pausable {
     /**
      * @dev Calculates required collateral for a loan
      */
-    function calculateRequiredCollateral(uint256 principal) public view returns (uint256) {
+    function calculateRequiredCollateral(uint256 principal) public pure returns (uint256) {
         return (principal * MINIMUM_COLLATERAL_RATIO) / 100;
     }
 

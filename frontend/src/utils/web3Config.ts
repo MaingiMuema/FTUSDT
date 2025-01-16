@@ -9,12 +9,6 @@ import FTUSDT_ABI from '../contracts/FTUSDT.json';
 export const COLLATERAL_MANAGER_ADDRESS = process.env.NEXT_PUBLIC_COLLATERAL_MANAGER_ADDRESS;
 export const FTUSDT_ADDRESS = process.env.NEXT_PUBLIC_FTUSDT_ADDRESS;
 
-declare global {
-  interface Window {
-    ethereum?: any;
-  }
-}
-
 export const getWeb3 = async () => {
   if (typeof window !== 'undefined' && typeof window.ethereum !== 'undefined') {
     try {
@@ -49,23 +43,49 @@ export const getFTUSDTContract = async (web3: Web3) => {
 
 export const connectWallet = async () => {
   try {
+    if (!window.ethereum) {
+      throw new Error('Please install Trust Wallet!');
+    }
+    
     const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    if (!accounts || accounts.length === 0) {
+      throw new Error('No accounts found!');
+    }
+    
     return accounts[0];
   } catch (error) {
+    if (error instanceof Error) {
+      throw new Error(error.message);
+    }
     throw new Error('Failed to connect wallet');
   }
 };
 
 export const checkAndSwitchNetwork = async (chainId: string) => {
-  if (window.ethereum.networkVersion !== chainId) {
-    try {
-      await window.ethereum.request({
-        method: 'wallet_switchEthereumChain',
-        params: [{ chainId: Web3.utils.toHex(chainId) }],
-      });
-    } catch (error: any) {
-      throw new Error('Failed to switch network');
+  try {
+    if (!window.ethereum) {
+      throw new Error('Please install Trust Wallet!');
     }
+
+    if (window.ethereum.networkVersion !== chainId) {
+      try {
+        await window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: Web3.utils.toHex(chainId) }],
+        });
+      } catch (switchError: any) {
+        // This error code indicates that the chain has not been added to Trust Wallet
+        if (switchError.code === 4902) {
+          throw new Error('Please add this network to your Trust Wallet');
+        }
+        throw switchError;
+      }
+    }
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new Error(error.message);
+    }
+    throw new Error('Failed to switch network');
   }
 };
 
